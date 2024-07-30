@@ -138,6 +138,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
     // Fetch Graph Types from Dynamodb
     // ===============================
     let (node_types, graph_prefix_wdot) = types::fetch_graph_types(&dynamo_client, graph).await?; 
+    let graph_sn=graph_prefix_wdot[..graph_prefix_wdot.find('.')];
     println!("Node Types:");
     // let nodetypes = type_caches.node_types.clone();
     //for t in ty_r.0.iter() {
@@ -207,11 +208,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
     println!("Start background services ... each reading from channel");
     let hdls = start_db_load_tasks(
         arc_load_recvr,
-        graph_short_name,
-        type_caches.ty_c.clone(),
-        type_caches.attr_ty_s.clone(),
-        type_caches.ty_short_nm.clone(),
-        type_caches.ty_long_nm.clone(),
+        graph_sn,
+        node_types,
         uuid_ch,
         child_edge_ch,
         edge_ch,
@@ -285,11 +283,8 @@ type NODES = [Node;BATCH_SIZE];
 
 fn start_db_load_tasks(
     alr: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<NODES>>>,
-    graph_short_name: String,
-    tycache: Arc<HashMap<String, types::TyAttrBlock>>,
-    attr_ty_s_: Arc<HashMap<types::AttrTyS, String>>,
-    ty_short_nm_: Arc<HashMap<String, String>>,
-    ty_long_nm_: Arc<HashMap<String, String>>,
+    graph_sn: &str,
+    graph_types : Arc<types::NodeTypes>,
     uuid_ch: tokio::sync::mpsc::Sender<service::uuid::UuidAdd>,
     child_edge_ch: tokio::sync::mpsc::Sender<Vec<service::child_edge::ChildEdgeRec>>,
     edge_ch: tokio::sync::mpsc::Sender<service::parent_edge::EdgeCnt>,
@@ -305,7 +300,7 @@ fn start_db_load_tasks(
     for i in 0..LOAD_THREADS {
         let ii: usize = i;
         let alr_c = alr.clone();
-        let tycache_c = tycache.clone();
+        let gr_types = graph_types.clone();
         let uuid_ch_ = uuid_ch.clone();
         let child_edge_ch_ = child_edge_ch.clone();
         let edge_ch_ = edge_ch.clone();
@@ -314,10 +309,7 @@ fn start_db_load_tasks(
         //let dbconn = mysql_pool.get_conn()?; // error: cannot use the `?` operator in a function that returns `Vec<std::thread::JoinHandle<()>>`
         let pool = mysql_pool.clone();
         let client = dynamo_client.clone();
-        let graph_sname = graph_short_name.clone();
-        let attr_ty_s = attr_ty_s_.clone();
-        let ty_short_nm = ty_short_nm_.clone();
-        let ty_long_nm = ty_long_nm_.clone();
+        let graph_sname = graph_sn.to_owned();
 
         println!(" start process_node_batch......{}", i);
         let handle = std::thread::spawn(move || {
@@ -326,10 +318,7 @@ fn start_db_load_tasks(
                 ii,
                 alr_c,
                 graph_sname,
-                tycache_c,
-                attr_ty_s,
-                ty_short_nm,
-                ty_long_nm,
+                gr_types,
                 uuid_ch_,
                 child_edge_ch_,
                 edge_ch_,
@@ -556,11 +545,8 @@ const DYNAMO_BATCH_SIZE: usize = 25;
 fn process_node_batch<'a>(
     i: usize,
     alr: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<NODES>>>,
-    graph_short_name: String,
-    graph_types: Arc<HashMap<String, types::TyAttrBlock>>,
-    attr_ty_s_: Arc<HashMap<types::AttrTyS, String>>,
-    ty_short_nm_: Arc<HashMap<String, String>>,
-    ty_long_nm_: Arc<HashMap<String, String>>,
+    graph_sn: String,
+    graph_types: Arc<types:NodeTypes>,
     uuid_ch: tokio::sync::mpsc::Sender<service::uuid::UuidAdd>,
     child_edge_ch: tokio::sync::mpsc::Sender<Vec<service::child_edge::ChildEdgeRec>>,
     edge_ch: tokio::sync::mpsc::Sender<service::parent_edge::EdgeCnt>,
@@ -611,12 +597,8 @@ fn process_node_batch<'a>(
             }
             //println!("> process_node_batch process node {}", node.pkey.to_string());
             // get node attributes (n_attrs)
-            let node_attrs = graph_types.get(&node.node_type);
-            if node_attrs.is_none() {
-                println!("error: process_node_batch: graph_types.get() for node.id [{}]. node pkey [{}], node_type [{}]",node.id, node.pkey, node.node_type);
-                panic!("no type data for node type {} found", &node.node_type)
-            }
-            let attrs = node_attrs.unwrap().0.as_slice();
+            let node_ty = graph_types.get(&node.node_type);
+            let attrs = node_ty.get_attrs();
 
             //                        attr_name
             let mut flat_rdf_map: HashMap<&str, FlattenRdf> = HashMap::new();
@@ -630,10 +612,6 @@ fn process_node_batch<'a>(
                         continue;
                     }
                     found = true;
-                    // println!(
-                    //     "dt line:attr.name [{}] attr.dt [{}] line {:?}",
-                    //     attr.name, attr.dt, line
-                    // );
 
                     match attr.dt.as_str() {
                         // "Bl", .... TODO
