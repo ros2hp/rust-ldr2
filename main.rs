@@ -137,9 +137,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
     let config = aws_config::from_env().region("us-east-1").load().await;
     let dynamo_client = DynamoClient::new(&config);
     let graph = "Movies".to_string();
-    // ===============================================
-    // Fetch Graph Types from MySQ based on graph name
-    // ===============================================
+    // ===============================
+    // Fetch Graph Types from Dynamodb
+    // ===============================
     let (node_types, graph_prefix_wdot) = types::fetch_graph_types(&dynamo_client, graph).await?; 
 
     
@@ -205,15 +205,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
 
     // mpsc - multi-producer-single-consumer need to be changed to spmc, single-producer-multi-consumer
     // using multiple consumers (channel readers) reading from a single channel sync'd via a mutex.
-    //let (sender, receiver) = channel::<Box<[Node]>>();
-    //let (sender, receiver) = sync_channel::<Box<[Node]>>(9);
     let (sender, receiver) = sync_channel::<NODES>((LOAD_THREADS) * 2);
-    //let (sender, receiver) = tokio::sync::mpsc::channel::<NODES>(9);
-
     let arc_load_recvr = Arc::new(std::sync::Mutex::new(receiver));
 
-    println!("connected to mysql......");
-    
     // start database load tasks (implemented as OS threads) - reads rdf data from channel
     println!("Start background services ... each reading from channel");
     let hdls = start_db_load_tasks(
@@ -260,9 +254,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
     
     println!("Exit program");
 
-
-
-    Ok(()) //return Ok(());
+    Ok(()) 
 }
 
 #[derive(Debug)]
@@ -282,22 +274,6 @@ struct Node {
                      //err    : Vec<Eerror> // used by verification process to record any errors
 }
 
-// impl Node {
-
-//     fn attributes<'a>(&self, ty_c : Arc<HashMap<String,types::block::TyAttrBlock<'a>>>) -> &Vec<types::block::TyAttrD<'a>> {
-
-// 	    if self.node_type.len() == 0 {
-// 		    panic!("No Type defined for {}",self.pkey);
-// 	    }
-// 	    let x = ty_c.get(&self.node_type);
-// 	    if x.is_none() {
-// 	        panic!("error in Node::attributes(), no entry found in ty_c cache for {}",self.node_type);
-// 	    }
-
-// 	    &x.unwrap().0
-
-//     }
-// }
 
 impl Default for Node {
     fn default() -> Node {
