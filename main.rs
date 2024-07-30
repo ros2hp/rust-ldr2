@@ -102,23 +102,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
     //let rt = Runtime::new().unwrap();
     let rt_handle = Handle::current();
 
-    //let url = "mysql://admin:gjIe8Hl9SFD1g3ahyu6F@mysql8.cjegagpjwjyi.us-east-1.rds.amazonaws.com:3306/GoGraph";
-    //let mysql_pool = mysql_async::Pool::new(url);
+    // ================================
+    // Create a a mysql connection pool
+    // ================================   
     let pool_opts = mysql_async::PoolOpts::new()
         .with_constraints(mysql_async::PoolConstraints::new(5, 30).unwrap())
         .with_inactive_connection_ttl(Duration::from_secs(60));
 
-    // ================================
-    // Create a a mysql connection pool
-    // ================================    
-    let host = "mysql8.cjegagpjwjyi.us-east-1.rds.amazonaws.com";
+    let host = "mysql8.???.us-east-1.rds.amazonaws.com";
     let mysql_pool = mysql_async::Pool::new(
         mysql_async::OptsBuilder::default()
             //.from_url(url)
             .ip_or_hostname(host)
-            .user(Some("admin"))
-            .pass(Some("gjIe8Hl9SFD1g3ahyu6F"))
-            .db_name(Some("GoGraph"))
+            .user(Some("???"))
+            .pass(Some("?????"))
+            .db_name(Some("???"))
             .pool_opts(pool_opts),
     );
     let pool = mysql_pool.clone();
@@ -128,12 +126,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
     r#"truncate table Edge_test"#.ignore(&mut conn).await?; 
     r#"truncate table load_log"#.ignore(&mut conn).await?; 
     r#"truncate table rdf_key_map"#.ignore(&mut conn).await?; 
-
+    
+    let _start_1 = Instant::now(); 
     // ========================
     // Create a Dynamodb Client
     // ========================
-    let _start_1 = Instant::now();  
-    // create a dynamodb client
     let config = aws_config::from_env().region("us-east-1").load().await;
     let dynamo_client = DynamoClient::new(&config);
     let graph = "Movies".to_string();
@@ -141,8 +138,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
     // Fetch Graph Types from Dynamodb
     // ===============================
     let (node_types, graph_prefix_wdot) = types::fetch_graph_types(&dynamo_client, graph).await?; 
-
-    
     println!("Node Types:");
     // let nodetypes = type_caches.node_types.clone();
     //for t in ty_r.0.iter() {
