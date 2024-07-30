@@ -108,6 +108,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
         .with_constraints(mysql_async::PoolConstraints::new(5, 30).unwrap())
         .with_inactive_connection_ttl(Duration::from_secs(60));
 
+    // ================================
+    // Create a a mysql connection pool
+    // ================================    
     let host = "mysql8.cjegagpjwjyi.us-east-1.rds.amazonaws.com";
     let mysql_pool = mysql_async::Pool::new(
         mysql_async::OptsBuilder::default()
@@ -126,23 +129,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
     r#"truncate table load_log"#.ignore(&mut conn).await?; 
     r#"truncate table rdf_key_map"#.ignore(&mut conn).await?; 
 
+    // ========================
+    // Create a Dynamodb Client
+    // ========================
+    let _start_1 = Instant::now();  
     // create a dynamodb client
-    let region = "us-east-1";
-    let dynamo_client = types::make_dynamodb_client(region).await;
-    println!("connected to Dynamodb....");
+    let config = aws_config::from_env().region("us-east-1").load().await;
+    let dynamo_client = DynamoClient::new(&config);
+    let graph = "Movies".to_string();
+    // ===============================================
+    // Fetch Graph Types from MySQ based on graph name
+    // ===============================================
+    let (node_types, graph_prefix_wdot) = types::fetch_graph_types(&dynamo_client, graph).await?; 
 
-    let graph_short_name = "m".to_owned();
-    let graph_long_name = "Movie".to_owned();
-
-    // broadcast channel to shutdown services
+    
+    println!("Node Types:");
+    // let nodetypes = type_caches.node_types.clone();
+    //for t in ty_r.0.iter() {
+    for t in node_types.0.iter() {
+        println!("Node type {} [{}]    reference {}",t.get_long(),t.get_short(),t.is_reference());
+        for attr in t {
+            println!("attr.name [{}] dt [{}]  c [{}]",attr.name,attr.dt, attr.c);
+        }
+    }
+    
+    // create broadcast channel to shutdown services
     let (shutdown_broadcast_ch, mut shutdown_recv_ch) = broadcast::channel(1); // broadcast::channel::<u8>(1);
-
+    
     // start UUID service
     let (uuid_ch, mut add_rx) = tokio::sync::mpsc::channel(250);
     let (child_edge_ch, mut child_edge_rx) = tokio::sync::mpsc::channel(250);
     let (edge_ch, mut edge_rx) = tokio::sync::mpsc::channel(250);
     // let (query_tx, mut query_rx) = tokio::sync::mpsc::channel(16);
-    //
+    
+    // start Retry service (handles failed putitems) 
     let (retry_ch, mut retry_rx) = tokio::sync::mpsc::channel(LOAD_THREADS * 2);
     let mut retry_shutdown_ch = shutdown_broadcast_ch.subscribe();
     let retry_service = service::retry::start_service(
@@ -152,7 +172,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
         retry_shutdown_ch,
         table_name,
     );
-    //
+    // start uuid service - repo of node uuid values
     let mut uuid_shutdown_ch = shutdown_broadcast_ch.subscribe();
     let uuid_service = service::uuid::start_uuid_service(
         mysql_pool.clone(),
@@ -161,6 +181,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
         uuid_shutdown_ch,
     );
 
+    // start child_edge service
     let mut child_edge_shutdown_ch = shutdown_broadcast_ch.subscribe();
     let child_edge_service = service::child_edge::start_child_edge_service(
         mysql_pool.clone(),
@@ -168,60 +189,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
         child_edge_rx,
         child_edge_shutdown_ch,
     );
-
+    
+    // start parent_edge service
     let mut parent_edge_shutdown_ch = shutdown_broadcast_ch.subscribe();
-
     let parent_edge_service = service::parent_edge::start_parent_edge_service(
         rt_handle.clone(),
         edge_rx,
         parent_edge_shutdown_ch,
         mysql_pool.clone(),
     );
-
-    let prefix = types::db_graph_prefix(&dynamo_client, graph).await?;
-
-    println!("graph prefix : [{}]", prefix);
-
-    let mut ty_all = types::db_load_types(&dynamo_client, prefix.as_str()).await?;
-
-    println!("fetched types #{}", ty_all.0.len());
-
-    for v in ty_all.0.iter() {
-        println!("tyall : {} {} {}", v.attr, v.nm, v.ix);
-    }
-
-    let mut type_caches = types::populate_type_cache_1(&dynamo_client, prefix, &mut ty_all).await?; // prefix consumed...
-
-    // debug ///
-
-    println!("\n from types::populate_type_cache_1().....\n");
-    let c = type_caches.ty_c.clone();
-    println!(">> ty_c\n");
-    for (k, v) in c.iter() {
-        println!("\n type {} ", k);
-        for i in &v.0 {
-            println!("item {:?} | {:?}  ", k, i);
-        }
-    }
-
-    println!("\n>> attr_ty_s\n");
-    let ty_s = type_caches.attr_ty_s.clone();
-    for (k, v) in ty_s.iter() {
-        println!(" attr_ty_s K,v  {} | {}", k, v);
-    }
-    println!("\n>> type_caches.set\n");
-    for s in &type_caches.set {
-        println!("set {}", s);
-    }
-    // end debug
-
-    // populate another cache that depends on refs to other caches in type_caches.
-    //type_caches.ty_attr_d = types::populate_type_cache_2(type_caches.ty_c.clone());
-
-    println!("\n from types::populate_type_cache_2().....\n");
-    for (k, v) in &type_caches.ty_attr_d {
-        println!(">>> attr item {:?} | {:?}  ", k, v);
-    }
 
     println!("\nfile [{:?}]", file);
 
@@ -237,6 +213,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
     let arc_load_recvr = Arc::new(std::sync::Mutex::new(receiver));
 
     println!("connected to mysql......");
+    
+    // start database load tasks (implemented as OS threads) - reads rdf data from channel
     println!("Start background services ... each reading from channel");
     let hdls = start_db_load_tasks(
         arc_load_recvr,
@@ -254,6 +232,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>
         dynamo_client,
     );
 
+    // syncrhonous rdf reader - passes rdf data on channel to be processed by database loader threads. 
+    // Implements a spmc channel communication communication pattern, as opposed to the standard mpsc pattern. 
     process_rdf_file(f, sender);
 
     // wait for background services to finish
@@ -575,7 +555,7 @@ fn process_rdf_file(
 // }
 struct FlattenRdf<'a> {
     //    pkey: &'a str,      // subject
-    ty: Option<&'a types::TyAttrD>,
+    ty: Option<&'a types::TyAttrD>,   // attribute type. Why is the Option?
     sortk: String,
     value_str: Option<&'a str>,
     value_vstr: Option<Vec<&'a str>>, // used for Dynamo List type and graph edges (uidpreds)
@@ -667,7 +647,7 @@ fn process_node_batch<'a>(
             }
             let attrs = node_attrs.unwrap().0.as_slice();
 
-            //                             attr_name
+            //                        attr_name
             let mut flat_rdf_map: HashMap<&str, FlattenRdf> = HashMap::new();
 
             for line in &node.lines {
@@ -675,7 +655,7 @@ fn process_node_batch<'a>(
 
                 for attr in attrs {
                     // match attribute name against rdf predicate
-                    if attr.name != line.p {
+                    if attr.name != line.p {  // spo
                         continue;
                     }
                     found = true;
@@ -813,7 +793,7 @@ fn process_node_batch<'a>(
             // flat_rdf_map.insert("__type__", frdf);
 
             let mut child_edge: Vec<service::child_edge::ChildEdgeRec> = vec![];
-            let attr_ty_s = attr_ty_s_.clone();
+            let attr_ty_s = attr_ty_s_.clone();          // NOT USED
             let ty_short_nm = ty_short_nm_.clone();
 
             bat_w_req = rt_handle.block_on(async {   // no move. bat_w_req moved automatically as it is moved in one of the dynamo API's
@@ -912,6 +892,8 @@ fn process_node_batch<'a>(
                 let puid_ = puid.clone();
                 let puid_b = Blob::new(puid_.as_bytes());
                 let puid_b8 = Blob::new(&puid_.as_bytes()[..8]);
+                
+                // m|P
                 let mut pfx_node_type = graph_short_name.clone();
                 pfx_node_type.push('|');
                 pfx_node_type.push_str(ty_short_nm.get(&node.node_type[..]).unwrap());         
@@ -974,16 +956,41 @@ fn process_node_batch<'a>(
                     
                     let put = match nv.ty.unwrap().dt.as_str() {
 
-                        "I" => {
-				            put.item("N", AttributeValue::N(nv.value_str.unwrap().to_owned()))
-				            .item("P", AttributeValue::S(pfx_attr_name))
-				            .item("Ty", AttributeValue::S(pfx_node_type.to_string()))
-                            }
-                        "F" => {
-                            put.item("N", AttributeValue::N(nv.value_str.unwrap().to_owned()))
-				            .item("P", AttributeValue::S(pfx_attr_name))
-				            .item("Ty", AttributeValue::S(pfx_node_type.to_string()))
-				            }
+                        "I","F" => {
+                            // adopt this pattern for storing nullable types.
+                            // I and F whichboth use the N attribute (value AttributeValue::N).
+                            // On reading from db either
+                            // 1. use type system to determine whether to read N as an I or F 
+                            // 2. use TyA attribute which stores either an I or F. So type details are stored in the db 
+                            // Also, use either
+                            // 1. Nul attribute to indicate NULL value in associated N attribute
+                            // 2. store AttributeValue::Null in place of AttributeValue::N in N attribute
+                            match nv.value_str {
+                                None => { 
+                                        if !nv.ty.nullable  {
+                                            panic!("Data error: attribute {} is not nullable", k)
+                                        }
+                                		put.item("P", AttributeValue::S(pfx_attr_name))
+				                        .item("Ty", AttributeValue::S(pfx_node_type.to_string()))
+                                        .item("Nul", AttributeValue::Null(true));
+				                        match nv.ty.dt {
+                                            "I" => { put.item("N", AttributeValue::Null(true) },
+                                            "F" => { put.item("N", AttributeValue::Null(true) },
+                                        }
+                                Some(_) => {
+                                		put.item("N", AttributeValue::S(nv.value_str)
+                                		.item("P", AttributeValue::S(pfx_attr_name))
+				                        .item("Ty", AttributeValue::S(pfx_node_type.to_string()))
+				                        .item("Nul", AttributeValue::Null(false));
+				                        match nv.ty.dt {
+                                            "I" => { put.item("N", AttributeValue::S("I".to_owned()) },
+                                            "F" => { put.item("N", AttributeValue::S("F".to_owned()) },
+                                        }
+                                }
+                            };
+
+                            ,
+                            
 				        "S" => {
 				            let put = match nv.ty.unwrap().ix.as_str() {
 
@@ -1002,6 +1009,7 @@ fn process_node_batch<'a>(
 				                    } 
 				            };
 				            put.item("Ty", AttributeValue::S(pfx_node_type.to_string()))
+				            .item("TyA", AttributeValue::S("S".to_owned()))
 				            }
 				            
 				        // TODO: "LS", "LN", "LB", "LBl" 
@@ -1009,11 +1017,15 @@ fn process_node_batch<'a>(
 				        "B" => {
                             put.item("B", AttributeValue::S(nv.value_str.unwrap().to_owned()))
                             .item("P", AttributeValue::S(pfx_attr_name))
+                            .item("Ty", AttributeValue::S(pfx_node_type.to_string()))
+				            .item("TyA", AttributeValue::S("B".to_owned()))
 				            } 
 				            
 				        "Bl" => {
                             put.item("Bl", AttributeValue::S(nv.value_str.unwrap().to_owned()))
                             .item("P", AttributeValue::S(pfx_attr_name))
+                            .item("Ty", AttributeValue::S(pfx_node_type.to_string()))
+				            .item("TyA", AttributeValue::S("Bl".to_owned()))
 				            }
 				        
 				        "LS" => {
@@ -1023,6 +1035,8 @@ fn process_node_batch<'a>(
 				            }
                             put.item("LS", AttributeValue::L(ls))
                             .item("P", AttributeValue::S(pfx_attr_name))
+                            .item("Ty", AttributeValue::S(pfx_node_type.to_string()))
+				            .item("TyA", AttributeValue::S("LS".to_owned()))
 				            }
 				        
 				        "LI" => {
@@ -1030,8 +1044,10 @@ fn process_node_batch<'a>(
 				            for v in nv.value_vstr.unwrap() {
 				                ls.push(AttributeValue::N(v.to_owned()))
 				            }
-                            put.item("LS", AttributeValue::L(ls))
+                            put.item("LI", AttributeValue::L(ls))
                             .item("P", AttributeValue::S(pfx_attr_name))
+                            .item("Ty", AttributeValue::S(pfx_node_type.to_string()))
+				            .item("TyA", AttributeValue::S("LI".to_owned()))
 				            }
 				            
 				        "LF" => {
@@ -1041,6 +1057,8 @@ fn process_node_batch<'a>(
 				            }
                             put.item("LS", AttributeValue::L(ls))
                             .item("P", AttributeValue::S(pfx_attr_name))
+                            .item("Ty", AttributeValue::S(pfx_node_type.to_string()))
+				            .item("TyA", AttributeValue::S("LF".to_owned()))
 				            }
 				            
 				        _ => {put}
